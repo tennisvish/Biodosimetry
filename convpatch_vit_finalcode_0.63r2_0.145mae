@@ -1,0 +1,546 @@
+"""
+CONVPATCH VIT — FINAL MODEL (STEP 3)
+=====================================
+ConvPatch Vision Transformer for X-ray biodosimetry
+Single-channel 53BP1 input, MSE loss, no auxiliary heads.
+
+Performance: R²=0.6352  MAE=0.1455 Gy
+Dataset:     X-ray only, hr_post_exposure=4, N=13,847 images
+Split:       70% train / 20% val / 10% test, stratified by dose
+
+Architecture:
+  ConvPatchEncoder: conv(3×3) → conv(3×3) → conv(14×14, s=14)
+                    → 256 tokens + CLS → positional embedding
+  6 × TransformerBlock: post-norm MHA + depthwise conv MLP
+  LayerNorm → CLS → Dense(512) → Dense(256) → Dense(128) → Dense(1)
+
+Key design choices:
+  - ConvPatchEncoder replaces standard patch extraction with 3 conv
+    layers before patching, building local edge/intensity features
+    before the transformer sees the sequence
+  - Depthwise conv in MLP preserves spatial locality within patch grid
+  - MSE loss directly optimises R² rather than MAE's median behaviour
+  - Mixup augmentation [0.3, 0.7] prevents overconfident predictions
+    at discrete dose boundaries
+
+Preprocessing:
+  IMREAD_UNCHANGED (16-bit) → clip[400, 4000] → CLAHE(clipLimit=2.0,
+  tileGridSize=8×8) → resize(224×224) → (img − 400) / 3600
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from tensorflow.keras.callbacks import EarlyStopping
+from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.model_selection import train_test_split
+import cv2
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+print(f"TensorFlow: {tf.__version__}")
+print(f"GPU: {tf.config.list_physical_devices('GPU')}")
+
+# ============================================================================
+# PATHS
+# ============================================================================
+
+CSV_PATH   = '/kaggle/input/datasets/tennisvish/cleaned-mentor-countsforxrayonlyvit/cleaned_mentor_counts_finaljan17.csv'
+IMAGES_DIR = '/kaggle/input/datasets/tennisvish/trainvitxray/train copy'
+
+# ============================================================================
+# HYPERPARAMETERS
+# ============================================================================
+
+IMG_HEIGHT, IMG_WIDTH = 224, 224
+BATCH_SIZE            = 32
+MAX_EPOCHS            = 100
+EARLY_STOP_PATIENCE   = 90
+
+PATCH   = 14
+DIM     = 256
+LAYERS  = 6
+HEADS   = 8
+DROPOUT = 0.15
+LR      = 1e-4
+
+# ============================================================================
+# PREPROCESSING
+# ============================================================================
+
+def load_image(filepath):
+    try:
+        img = cv2.imread(filepath, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            return None
+        img = np.clip(img, 400, 4000).astype(np.uint16)
+        img = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(img)
+        img = cv2.resize(img, (IMG_WIDTH, IMG_HEIGHT))
+        img = (img.astype(np.float32) - 400) / (4000 - 400)
+        return np.expand_dims(img, axis=-1)
+    except Exception:
+        return None
+
+# ============================================================================
+# DATA
+# ============================================================================
+
+def load_and_split():
+    df = pd.read_csv(CSV_PATH)
+    df['filepath'] = df['filename'].apply(
+        lambda x: os.path.join(IMAGES_DIR, x))
+    df = df[df['filename'].str.endswith('.tif')]
+    df = df[df['hr_post_exposure'] == 4]
+    df = df[df['particle_type'] == 'X-ray'].copy()
+    df = df.dropna(subset=['dose_Gy'])
+
+    print(f"\nX-ray dataset: {len(df):,} images")
+    print("Dose distribution:")
+    print(df['dose_Gy'].value_counts().sort_index().to_string())
+
+    df['dose_group'] = df['dose_Gy'].astype(str)
+    train_val, test_meta = train_test_split(
+        df, test_size=0.10, random_state=42, stratify=df['dose_group'])
+    train_meta, val_meta = train_test_split(
+        train_val, test_size=0.222, random_state=42,
+        stratify=train_val['dose_group'])
+
+    for meta in [train_meta, val_meta, test_meta]:
+        meta.reset_index(drop=True, inplace=True)
+
+    print(f"Split → Train: {len(train_meta):,}  "
+          f"Val: {len(val_meta):,}  Test: {len(test_meta):,}")
+    return train_meta, val_meta, test_meta
+
+
+def compute_stats(train_meta):
+    std = float(train_meta['dose_Gy'].std())
+    stats = {
+        'mean': float(train_meta['dose_Gy'].mean()),
+        'std':  std if std > 0 else 1.0,
+    }
+    print(f"\nDose stats (train): mean={stats['mean']:.4f}  "
+          f"std={stats['std']:.4f}")
+    return stats
+
+# ============================================================================
+# DATASET
+# ============================================================================
+
+def create_dataset(metadata, batch_size, stats, augment=False, mixup=False):
+    def generator():
+        indices = np.arange(len(metadata))
+        if augment:
+            np.random.shuffle(indices)
+        for idx in indices:
+            row = metadata.iloc[idx]
+            img = load_image(row['filepath'])
+            if img is None:
+                continue
+            if augment:
+                if np.random.rand() > 0.5: img = np.fliplr(img)
+                if np.random.rand() > 0.5: img = np.flipud(img)
+                if np.random.rand() > 0.5:
+                    img = np.rot90(img, np.random.randint(1, 4))
+                if np.random.rand() > 0.5:
+                    img = np.clip(img * np.random.uniform(0.8, 1.2), 0, 1)
+
+            dose_norm = np.array(
+                [(row['dose_Gy'] - stats['mean']) / stats['std']],
+                dtype=np.float32)
+            yield img, dose_norm
+
+    ds = tf.data.Dataset.from_generator(
+        generator,
+        output_signature=(
+            tf.TensorSpec(shape=(IMG_HEIGHT, IMG_WIDTH, 1), dtype=tf.float32),
+            tf.TensorSpec(shape=(1,), dtype=tf.float32),
+        ))
+    ds = ds.batch(batch_size)
+    if mixup:
+        ds = ds.map(_mixup_batch, num_parallel_calls=tf.data.AUTOTUNE)
+    return ds.prefetch(tf.data.AUTOTUNE)
+
+
+def _mixup_batch(images, labels):
+    bs      = tf.shape(images)[0]
+    lam     = tf.random.uniform([bs], 0.3, 0.7)
+    lam_img = tf.reshape(lam, [bs, 1, 1, 1])
+    lam_lbl = tf.reshape(lam, [bs, 1])
+    idx     = tf.random.shuffle(tf.range(bs))
+    return (
+        lam_img * images + (1 - lam_img) * tf.gather(images, idx),
+        lam_lbl * labels + (1 - lam_lbl) * tf.gather(labels, idx),
+    )
+
+# ============================================================================
+# ARCHITECTURE
+# ============================================================================
+
+@keras.saving.register_keras_serializable()
+class ConvPatchEncoder(layers.Layer):
+    """
+    Convolutional patch embedding.
+
+    Replaces standard patch extraction with a three-stage conv pipeline:
+      conv1: 3×3, stride=1 — local edge and intensity features
+      conv2: 3×3, stride=1 — higher-level local patterns
+      conv3: patch_size×patch_size, stride=patch_size — patch splitting
+
+    The first two convolutions run at full image resolution before patching,
+    giving each patch token access to locally-contextualized features rather
+    than raw pixel values. This is particularly beneficial for detecting
+    small 53BP1 foci (~3-8px diameter) whose signal would otherwise be
+    split across patch boundaries.
+    """
+    def __init__(self, patch_size, projection_dim, **kwargs):
+        super().__init__(**kwargs)
+        self.patch_size     = patch_size
+        self.projection_dim = projection_dim
+
+    def build(self, input_shape):
+        h, w = input_shape[1], input_shape[2]
+        self.num_patches = (h // self.patch_size) * (w // self.patch_size)
+        mid = self.projection_dim // 2
+        self.conv1 = layers.Conv2D(self.projection_dim // 4, 3, 1, 'same',
+                                   use_bias=False, name='cp_conv1')
+        self.norm1 = layers.BatchNormalization(name='cp_bn1')
+        self.conv2 = layers.Conv2D(mid, 3, 1, 'same',
+                                   use_bias=False, name='cp_conv2')
+        self.norm2 = layers.BatchNormalization(name='cp_bn2')
+        self.conv3 = layers.Conv2D(self.projection_dim,
+                                   self.patch_size, self.patch_size,
+                                   'valid', use_bias=False, name='cp_conv3')
+        self.norm3     = layers.BatchNormalization(name='cp_bn3')
+        self.pos_embed = layers.Embedding(
+            self.num_patches + 1, self.projection_dim, name='cp_pos')
+        self.cls_token = self.add_weight(
+            name='cls', shape=(1, 1, self.projection_dim),
+            initializer='random_normal', trainable=True)
+        super().build(input_shape)
+
+    def call(self, images, training=False):
+        x   = tf.nn.gelu(self.norm1(self.conv1(images), training=training))
+        x   = tf.nn.gelu(self.norm2(self.conv2(x),      training=training))
+        x   = tf.nn.gelu(self.norm3(self.conv3(x),      training=training))
+        b   = tf.shape(images)[0]
+        enc = tf.reshape(x, [b, self.num_patches, self.projection_dim])
+        cls = tf.tile(self.cls_token, [b, 1, 1])
+        enc = tf.concat([cls, enc], axis=1)
+        return enc + self.pos_embed(tf.range(self.num_patches + 1))
+
+    def get_config(self):
+        return {**super().get_config(),
+                'patch_size':     self.patch_size,
+                'projection_dim': self.projection_dim}
+
+
+@keras.saving.register_keras_serializable()
+class TransformerBlock(layers.Layer):
+    """
+    Post-norm transformer block with depthwise convolution in the MLP.
+
+    Standard ViT MLP: Dense(4d) → GELU → Dense(d)
+    This MLP:         Dense(2d) → GELU → DepthwiseConv2D(3×3) → Dense(d)
+
+    The depthwise conv is applied to the patch token grid (reshaped from
+    sequence back to spatial layout). It preserves spatial locality between
+    adjacent patch tokens, which is important for detecting spatially
+    structured signals like clusters of 53BP1 foci.
+    """
+    def __init__(self, projection_dim, num_heads, dropout, **kwargs):
+        super().__init__(**kwargs)
+        self.projection_dim = projection_dim
+        self.num_heads      = num_heads
+        self.dropout_rate   = dropout
+
+    def build(self, input_shape):
+        self.att        = layers.MultiHeadAttention(
+            num_heads=self.num_heads,
+            key_dim=self.projection_dim // self.num_heads)
+        self.mlp_dense1 = layers.Dense(self.projection_dim * 2,
+                                       activation=tf.nn.gelu)
+        self.dw_conv    = layers.DepthwiseConv2D(
+            3, padding='same', use_bias=False,
+            depthwise_initializer='glorot_uniform')
+        self.mlp_drop   = layers.Dropout(self.dropout_rate)
+        self.mlp_dense2 = layers.Dense(self.projection_dim)
+        self.norm1      = layers.LayerNormalization(epsilon=1e-6)
+        self.norm2      = layers.LayerNormalization(epsilon=1e-6)
+        self.drop       = layers.Dropout(self.dropout_rate)
+        super().build(input_shape)
+
+    def call(self, x, training=False):
+        attn = self.att(self.norm1(x), self.norm1(x))
+        x    = x + self.drop(attn, training=training)
+        h    = self.mlp_dense1(self.norm2(x))
+        cls  = h[:, :1, :]
+        ptch = h[:, 1:, :]
+        n    = tf.shape(ptch)[1]
+        g    = tf.cast(tf.math.round(
+            tf.sqrt(tf.cast(n, tf.float32))), tf.int32)
+        pg   = tf.reshape(ptch, [tf.shape(x)[0], g, g,
+                                  self.projection_dim * 2])
+        pg   = self.dw_conv(pg)
+        ptch = tf.reshape(pg, [tf.shape(x)[0], -1,
+                                self.projection_dim * 2])
+        h    = tf.concat([cls, ptch], axis=1)
+        h    = self.mlp_drop(h, training=training)
+        h    = self.mlp_dense2(h)
+        return x + h
+
+    def get_config(self):
+        return {**super().get_config(),
+                'projection_dim': self.projection_dim,
+                'num_heads':      self.num_heads,
+                'dropout_rate':   self.dropout_rate}
+
+
+def build_model():
+    inputs = layers.Input(shape=(IMG_HEIGHT, IMG_WIDTH, 1))
+    x      = ConvPatchEncoder(PATCH, DIM, name='conv_patch')(inputs)
+
+    for i in range(LAYERS):
+        x = TransformerBlock(DIM, HEADS, DROPOUT,
+                             name=f'transformer_{i}')(x)
+
+    x      = layers.LayerNormalization(epsilon=1e-6, name='final_norm')(x)
+    cls    = x[:, 0, :]
+    shared = layers.Dense(512, activation=tf.nn.gelu, name='shared_1')(cls)
+    shared = layers.Dropout(DROPOUT, name='shared_drop_1')(shared)
+    shared = layers.Dense(256, activation=tf.nn.gelu, name='shared_2')(shared)
+    shared = layers.Dropout(DROPOUT, name='shared_drop_2')(shared)
+    dose_h = layers.Dense(128, activation=tf.nn.gelu, name='dose_dense')(shared)
+    dose_h = layers.Dropout(DROPOUT * 0.5, name='dose_drop')(dose_h)
+    dose   = layers.Dense(1, activation='linear', name='dose')(dose_h)
+
+    return keras.Model(inputs=inputs, outputs=dose,
+                       name='convpatch_vit_final')
+
+# ============================================================================
+# LR SCHEDULE
+# ============================================================================
+
+@keras.saving.register_keras_serializable()
+class WarmupCosineDecay(keras.optimizers.schedules.LearningRateSchedule):
+    """
+    Linear warmup for the first `warmup_steps` steps, then cosine decay
+    with warm restarts. The warmup stabilises training when MSE loss
+    produces large gradient magnitudes in early epochs.
+    """
+    def __init__(self, warmup_steps, base_lr, first_decay_steps):
+        super().__init__()
+        self.warmup_steps_val = warmup_steps
+        self.base_lr          = base_lr
+        self.cosine = keras.optimizers.schedules.CosineDecayRestarts(
+            initial_learning_rate=base_lr,
+            first_decay_steps=first_decay_steps,
+            t_mul=1.5, m_mul=0.9, alpha=1e-6)
+
+    def __call__(self, step):
+        s = tf.cast(step, tf.float32)
+        w = tf.cast(self.warmup_steps_val, tf.float32)
+        return tf.cond(s < w,
+                       lambda: self.base_lr * (s / w),
+                       lambda: self.cosine(s))
+
+    def get_config(self):
+        return {'warmup_steps': self.warmup_steps_val,
+                'base_lr':      self.base_lr}
+
+# ============================================================================
+# TTA
+# ============================================================================
+
+def predict_with_tta(model, img, stats, n_aug=8):
+    augments = [
+        lambda x: x,
+        lambda x: np.fliplr(x),
+        lambda x: np.flipud(x),
+        lambda x: np.rot90(x, 1),
+        lambda x: np.rot90(x, 2),
+        lambda x: np.rot90(x, 3),
+        lambda x: np.fliplr(np.rot90(x, 1)),
+        lambda x: np.flipud(np.rot90(x, 1)),
+    ]
+    preds = []
+    for aug_fn in augments[:n_aug]:
+        p       = model.predict(np.expand_dims(aug_fn(img), 0), verbose=0)
+        dose_gy = float(p[0][0]) * stats['std'] + stats['mean']
+        preds.append(dose_gy)
+    return float(np.mean(preds))
+
+# ============================================================================
+# TRAINING
+# ============================================================================
+
+def train():
+    print("\n" + "="*65)
+    print("CONVPATCH VIT — FINAL MODEL")
+    print(f"  patch={PATCH}  dim={DIM}  layers={LAYERS}  "
+          f"heads={HEADS}  dropout={DROPOUT}")
+    print(f"  Loss: MSE  |  Aux heads: none  |  Mixup: [0.3, 0.7]")
+    print("="*65 + "\n")
+
+    train_meta, val_meta, test_meta = load_and_split()
+    stats = compute_stats(train_meta)
+
+    train_steps = len(train_meta) // BATCH_SIZE
+    val_steps   = len(val_meta)   // BATCH_SIZE
+
+    train_ds = create_dataset(train_meta, BATCH_SIZE, stats,
+                               augment=True,  mixup=True)
+    val_ds   = create_dataset(val_meta,   BATCH_SIZE, stats,
+                               augment=False, mixup=False)
+
+    lr_schedule = WarmupCosineDecay(
+        warmup_steps=5 * train_steps,
+        base_lr=LR,
+        first_decay_steps=20 * train_steps)
+
+    model = build_model()
+    model.compile(
+        optimizer=keras.optimizers.AdamW(
+            learning_rate=lr_schedule,
+            weight_decay=0.02,
+            clipnorm=1.0),
+        loss='mean_squared_error',
+        metrics=['mae'])
+
+    print(f"Parameters:        {model.count_params():,}")
+    print(f"Train steps/epoch: {train_steps}  Val steps: {val_steps}\n")
+
+    start = datetime.now()
+    history = model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=MAX_EPOCHS,
+        steps_per_epoch=train_steps,
+        validation_steps=val_steps,
+        callbacks=[EarlyStopping(
+            monitor='val_loss',
+            patience=EARLY_STOP_PATIENCE,
+            mode='min',
+            restore_best_weights=True,
+            verbose=1)],
+        verbose=1
+    )
+    elapsed = (datetime.now() - start).total_seconds() / 3600
+
+    # Evaluate
+    print("\n" + "="*65)
+    print("TEST SET EVALUATION")
+    print("="*65 + "\n")
+
+    dose_true, dose_pred_std, dose_pred_tta = [], [], []
+
+    for _, row in test_meta.iterrows():
+        img = load_image(row['filepath'])
+        if img is None:
+            continue
+        p        = model.predict(np.expand_dims(img, 0), verbose=0)
+        dose_std = float(p[0][0]) * stats['std'] + stats['mean']
+        dose_tta = predict_with_tta(model, img, stats, n_aug=8)
+        dose_pred_std.append(dose_std)
+        dose_pred_tta.append(dose_tta)
+        dose_true.append(row['dose_Gy'])
+
+    dose_true     = np.array(dose_true)
+    dose_pred_std = np.array(dose_pred_std)
+    dose_pred_tta = np.array(dose_pred_tta)
+
+    r2_std  = r2_score(dose_true, dose_pred_std)
+    mae_std = mean_absolute_error(dose_true, dose_pred_std)
+    r2_tta  = r2_score(dose_true, dose_pred_tta)
+    mae_tta = mean_absolute_error(dose_true, dose_pred_tta)
+
+    print("="*65)
+    print("RESULTS")
+    print("="*65)
+    print(f"{'Method':25s}  {'MAE (Gy)':>10s}  {'R²':>10s}")
+    print(f"{'─'*50}")
+    print(f"{'Standard (no TTA)':25s}  {mae_std:>10.4f}  {r2_std:>10.4f}")
+    print(f"{'TTA (8 augments)':25s}  {mae_tta:>10.4f}  {r2_tta:>10.4f}")
+    print(f"{'TTA gain':25s}  {mae_tta-mae_std:>+10.4f}  "
+          f"{r2_tta-r2_std:>+10.4f}")
+    print("="*65)
+    print(f"\nTraining time: {elapsed:.2f}h  "
+          f"Epochs: {len(history.history['loss'])}")
+
+    print("\nPer-dose MAE:")
+    for d in sorted(np.unique(dose_true)):
+        m = dose_true == d
+        if m.sum() < 3: continue
+        print(f"  {d:.2f} Gy  n={m.sum():4d}  "
+              f"MAE={mean_absolute_error(dose_true[m], dose_pred_std[m]):.4f}  "
+              f"mean_pred={dose_pred_std[m].mean():.4f}")
+
+    # Save
+    model.save('convpatch_vit_final.keras')
+    pd.DataFrame({
+        'dose_true':     dose_true,
+        'dose_pred_std': dose_pred_std,
+        'dose_pred_tta': dose_pred_tta,
+    }).to_csv('convpatch_vit_final_preds.csv', index=False)
+
+    # Plot
+    fig, axes = plt.subplots(1, 3, figsize=(21, 7))
+    fig.suptitle(
+        f'ConvPatch ViT (Final)  |  '
+        f'R²={r2_std:.4f}  MAE={mae_std:.4f} Gy',
+        fontsize=13)
+    colors = {0.0: '#4477AA', 0.10: '#66CCEE', 1.0: '#EE6677'}
+
+    ax = axes[0]
+    for d, col in colors.items():
+        m = dose_true == d
+        if m.sum() > 0:
+            ax.scatter(dose_true[m], dose_pred_std[m],
+                       alpha=0.45, s=14, c=col, label=f'{d:.2f} Gy')
+    lo = min(dose_true.min(), dose_pred_std.min()) - 0.02
+    hi = max(dose_true.max(), dose_pred_std.max()) + 0.02
+    ax.plot([lo, hi], [lo, hi], 'r--', lw=2, label='Perfect')
+    ax.set_xlabel('True Dose (Gy)')
+    ax.set_ylabel('Predicted Dose (Gy)')
+    ax.set_title(f'Predicted vs True\nR²={r2_std:.4f}  MAE={mae_std:.4f} Gy')
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+
+    ax = axes[1]
+    for d, col in colors.items():
+        m = dose_true == d
+        if m.sum() > 0:
+            ax.hist(dose_pred_std[m], bins=30, alpha=0.6, color=col,
+                    label=f'{d:.2f} Gy (n={m.sum()})')
+    ax.set_xlabel('Predicted Dose (Gy)')
+    ax.set_ylabel('Count')
+    ax.set_title('Prediction distributions by dose level')
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+
+    ax = axes[2]
+    ax.plot(history.history['loss'],     label='Train', lw=2, color='steelblue')
+    ax.plot(history.history['val_loss'], label='Val',   lw=2, color='coral')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Dose Loss (MSE, normalised)')
+    ax.set_title('Training history')
+    ax.legend(); ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig('convpatch_vit_final_results.png', dpi=200, bbox_inches='tight')
+    plt.show()
+    print("\nSaved: convpatch_vit_final.keras | "
+          "convpatch_vit_final_preds.csv | convpatch_vit_final_results.png")
+
+    return model, history, r2_std, r2_tta
+
+
+if __name__ == "__main__":
+    model, history, r2_std, r2_tta = train()
+    print(f"\nFinal R² (no TTA): {r2_std:.4f}")
+    print(f"Final R² (TTA):    {r2_tta:.4f}")
