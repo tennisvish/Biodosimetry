@@ -332,8 +332,8 @@ def build_model():
 class WarmupCosineDecay(keras.optimizers.schedules.LearningRateSchedule):
     """
     Linear warmup for the first `warmup_steps` steps, then cosine decay
-    with warm restarts. The warmup stabilises training when MSE loss
-    produces large gradient magnitudes in early epochs.
+    with warm restarts. The warmup stabilizes training when MSE loss
+    produces large gradients in early epochs.
     """
     def __init__(self, warmup_steps, base_lr, first_decay_steps):
         super().__init__()
@@ -356,7 +356,8 @@ class WarmupCosineDecay(keras.optimizers.schedules.LearningRateSchedule):
                 'base_lr':      self.base_lr}
 
 # ============================================================================
-# TTA
+# TTA 
+# Optional metric not used in final report as it is extrinsic of model architecture
 # ============================================================================
 
 def predict_with_tta(model, img, stats, n_aug=8):
