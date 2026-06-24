@@ -62,7 +62,7 @@ IMAGES_DIR = '/kaggle/input/datasets/tennisvish/trainvitxray/train copy'
 IMG_HEIGHT, IMG_WIDTH = 224, 224
 BATCH_SIZE            = 32
 MAX_EPOCHS            = 100
-EARLY_STOP_PATIENCE   = 90
+EARLY_STOP_PATIENCE   = 90   # Forced comaprable training times for each model version to fairly evaluate
 
 PATCH   = 14
 DIM     = 256
